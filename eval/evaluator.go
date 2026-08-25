@@ -1,6 +1,8 @@
 package eval
 
 import (
+	"math"
+
 	"github.com/Samriddha9619/risk_ledger/data"
 	"github.com/Samriddha9619/risk_ledger/detector"
 )
@@ -130,4 +132,54 @@ func EvaluatePerPattern(alerts []detector.Alert, labels map[int64]data.FraudLabe
 		results = append(results, *pr)
 	}
 	return results
+}
+
+// MultiSeedResult holds aggregated metrics across multiple random seeds.
+type MultiSeedResult struct {
+	Seeds         []int64
+	F1s           []float64
+	Precisions    []float64
+	Recalls       []float64
+	MeanF1        float64
+	StdF1         float64
+	MeanPrecision float64
+	StdPrecision  float64
+	MeanRecall    float64
+	StdRecall     float64
+}
+
+// AggregateMultiSeed computes mean and standard deviation across seed runs.
+func AggregateMultiSeed(seeds []int64, results []EvalResult) MultiSeedResult {
+	ms := MultiSeedResult{Seeds: seeds}
+	for _, r := range results {
+		ms.F1s = append(ms.F1s, r.F1)
+		ms.Precisions = append(ms.Precisions, r.Precision)
+		ms.Recalls = append(ms.Recalls, r.Recall)
+	}
+	ms.MeanF1, ms.StdF1 = meanStd(ms.F1s)
+	ms.MeanPrecision, ms.StdPrecision = meanStd(ms.Precisions)
+	ms.MeanRecall, ms.StdRecall = meanStd(ms.Recalls)
+	return ms
+}
+
+// meanStd computes mean and population standard deviation of a float slice.
+func meanStd(vals []float64) (float64, float64) {
+	if len(vals) == 0 {
+		return 0, 0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	mean := sum / float64(len(vals))
+	sumSq := 0.0
+	for _, v := range vals {
+		d := v - mean
+		sumSq += d * d
+	}
+	std := 0.0
+	if len(vals) > 1 {
+		std = math.Sqrt(sumSq / float64(len(vals)))
+	}
+	return mean, std
 }
