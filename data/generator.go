@@ -113,14 +113,16 @@ func Generate(cfg GeneratorConfig) (totalTxns int, fraudTxns int, err error) {
 	defer txnWriter.Flush()
 
 	for _, t := range allTxns {
-		txnWriter.Write([]string{
+		if err := txnWriter.Write([]string{
 			strconv.FormatInt(t.TxnID, 10),
 			t.MerchantID,
 			strconv.FormatInt(t.AmountPaise, 10),
 			strconv.FormatInt(t.Timestamp, 10),
 			t.Method,
 			t.Category,
-		})
+		}); err != nil {
+			return 0, 0, fmt.Errorf("writing transaction CSV: %w", err)
+		}
 	}
 
 	// Write labels CSV
@@ -344,11 +346,24 @@ func timeOfDayWeight(hour int) float64 {
 }
 
 func sampleLogNormal(rng *rand.Rand, mean, std float64) int64 {
+	if mean <= 0 {
+		return 100 // minimum ₹1
+	}
 	// Convert mean/std of the actual distribution to log-space parameters
 	variance := std * std
-	mu := math.Log(mean*mean/math.Sqrt(variance+mean*mean))
+	denominator := math.Sqrt(variance + mean*mean)
+	if denominator <= 0 {
+		return int64(mean)
+	}
+	mu := math.Log(mean * mean / denominator)
 	sigma := math.Sqrt(math.Log(1.0 + variance/(mean*mean)))
+	if math.IsNaN(mu) || math.IsNaN(sigma) || sigma <= 0 {
+		return int64(mean)
+	}
 	sample := math.Exp(mu + sigma*rng.NormFloat64())
+	if math.IsNaN(sample) || math.IsInf(sample, 0) || sample < 0 {
+		return int64(mean)
+	}
 	return int64(sample)
 }
 
