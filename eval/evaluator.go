@@ -29,55 +29,6 @@ type PerPatternResult struct {
 	Recall  float64
 }
 
-// Evaluate computes binary classification metrics at a given threshold.
-func Evaluate(alerts []detector.Alert, labels map[int64]data.FraudLabel, threshold float64) EvalResult {
-	result := EvalResult{Threshold: threshold}
-
-	for _, alert := range alerts {
-		label := labels[alert.TxnID]
-		predicted := alert.CombinedScore >= threshold
-		actual := label.IsFraud
-
-		switch {
-		case predicted && actual:
-			result.TP++
-		case predicted && !actual:
-			result.FP++
-			// FP cost: merchant loses ~2% of blocked transaction value
-			// We don't have the amount in alert, so use a flat estimate
-			result.FPCost += 500 * 100 // ₹500 average transaction × 2% ≈ ₹10 per FP (in paise)
-		case !predicted && actual:
-			result.FN++
-			// FN cost: merchant loses full fraud amount
-			// Use average fraud amount estimate
-			result.FNCost += 5000 * 100 // ₹5000 average fraud amount (in paise)
-		case !predicted && !actual:
-			result.TN++
-		}
-	}
-
-	// Precision
-	if result.TP+result.FP > 0 {
-		result.Precision = float64(result.TP) / float64(result.TP+result.FP)
-	}
-	// Recall
-	if result.TP+result.FN > 0 {
-		result.Recall = float64(result.TP) / float64(result.TP+result.FN)
-	}
-	// F1
-	if result.Precision+result.Recall > 0 {
-		result.F1 = 2.0 * result.Precision * result.Recall / (result.Precision + result.Recall)
-	}
-	// FPR
-	if result.FP+result.TN > 0 {
-		result.FPR = float64(result.FP) / float64(result.FP+result.TN)
-	}
-	// Total cost
-	result.TotalCost = result.FPCost + result.FNCost
-
-	return result
-}
-
 // EvaluateWithAmounts computes metrics using actual transaction amounts for cost.
 func EvaluateWithAmounts(alerts []detector.Alert, labels map[int64]data.FraudLabel, amounts map[int64]int64, threshold float64) EvalResult {
 	result := EvalResult{Threshold: threshold}
