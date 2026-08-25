@@ -295,3 +295,45 @@ func WriteTriageJSON(path string, decisions []detector.TriageDecision, metrics d
 	return os.WriteFile(path, data, 0644)
 }
 
+// PrintMultiSeedReport outputs the multi-seed evaluation summary.
+func PrintMultiSeedReport(ms MultiSeedResult) {
+	sep := strings.Repeat("─", 60)
+	fmt.Println()
+	fmt.Println("  " + sep)
+	fmt.Println("  MULTI-SEED VALIDATION")
+	fmt.Println("  " + sep)
+	fmt.Println()
+
+	fmt.Printf("  Seeds tested: ")
+	for i, s := range ms.Seeds {
+		if i > 0 {
+			fmt.Printf(", ")
+		}
+		fmt.Printf("%d", s)
+	}
+	fmt.Println()
+	fmt.Println()
+
+	fmt.Println("  ┌────────────┬────────────────┬────────────────┬────────────────┐")
+	fmt.Println("  │ Seed       │ Precision      │ Recall         │ F1             │")
+	fmt.Println("  ├────────────┼────────────────┼────────────────┼────────────────┤")
+	for i, seed := range ms.Seeds {
+		fmt.Printf("  │ %-10d │ %.4f         │ %.4f         │ %.4f         │\n",
+			seed, ms.Precisions[i], ms.Recalls[i], ms.F1s[i])
+	}
+	fmt.Println("  ├────────────┼────────────────┼────────────────┼────────────────┤")
+	fmt.Printf("  │ Mean       │ %.4f         │ %.4f         │ %.4f         │\n",
+		ms.MeanPrecision, ms.MeanRecall, ms.MeanF1)
+	fmt.Printf("  │ Std        │ %.4f         │ %.4f         │ %.4f         │\n",
+		ms.StdPrecision, ms.StdRecall, ms.StdF1)
+	fmt.Println("  └────────────┴────────────────┴────────────────┴────────────────┘")
+	fmt.Println()
+
+	if ms.StdF1 > 0.05 {
+		fmt.Println("  ⚠ WARNING: F1 std > 0.05 — results may be sensitive to random seed")
+	} else {
+		fmt.Println("  ✓ F1 stable across seeds (std ≤ 0.05)")
+	}
+	fmt.Println()
+}
+
