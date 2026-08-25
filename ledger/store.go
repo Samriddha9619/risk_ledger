@@ -95,9 +95,18 @@ func (s *TransactionStore) LoadFromCSV(path string) (int, error) {
 		if len(row) < data.NumColumns {
 			continue
 		}
-		txnID, _ := strconv.ParseInt(row[0], 10, 64)
-		amountPaise, _ := strconv.ParseInt(row[2], 10, 64)
-		timestamp, _ := strconv.ParseInt(row[3], 10, 64)
+		txnID, err := strconv.ParseInt(row[0], 10, 64)
+		if err != nil {
+			return count, fmt.Errorf("parsing txn_id %q: %w", row[0], err)
+		}
+		amountPaise, err := strconv.ParseInt(row[2], 10, 64)
+		if err != nil {
+			return count, fmt.Errorf("parsing amount %q: %w", row[2], err)
+		}
+		timestamp, err := strconv.ParseInt(row[3], 10, 64)
+		if err != nil {
+			return count, fmt.Errorf("parsing timestamp %q: %w", row[3], err)
+		}
 
 		txn := data.Transaction{
 			TxnID:       txnID,
@@ -108,6 +117,8 @@ func (s *TransactionStore) LoadFromCSV(path string) (int, error) {
 			Category:    row[5],
 		}
 
+		// Zero the buffer before each use to prevent stale data
+		clear(buf)
 		txn.Serialize(s.desc, buf)
 		if _, err := s.tableHeap.InsertTuple(nil, buf); err != nil {
 			return count, fmt.Errorf("inserting txn %d: %w", txnID, err)
