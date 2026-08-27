@@ -163,3 +163,37 @@ func TestPerPatternRecall(t *testing.T) {
 		t.Errorf("amount_spike: caught=%d total=%d, want 1/2", as.Caught, as.Total)
 	}
 }
+
+// TestAggregateMultiSeed verifies mean and std computation.
+func TestAggregateMultiSeed(t *testing.T) {
+	seeds := []int64{42, 123, 456}
+	results := []EvalResult{
+		{F1: 0.5, Precision: 0.6, Recall: 0.4},
+		{F1: 0.6, Precision: 0.7, Recall: 0.5},
+		{F1: 0.7, Precision: 0.8, Recall: 0.6},
+	}
+
+	ms := AggregateMultiSeed(seeds, results)
+
+	// Mean F1 = (0.5+0.6+0.7)/3 = 0.6
+	if ms.MeanF1 < 0.599 || ms.MeanF1 > 0.601 {
+		t.Errorf("MeanF1 = %.4f, want ≈ 0.6", ms.MeanF1)
+	}
+
+	// Std F1 = sqrt(((0.1^2 + 0 + 0.1^2) / 3)) ≈ 0.0816
+	if ms.StdF1 < 0.05 || ms.StdF1 > 0.10 {
+		t.Errorf("StdF1 = %.4f, want ≈ 0.08", ms.StdF1)
+	}
+
+	if len(ms.Seeds) != 3 {
+		t.Errorf("Seeds count = %d, want 3", len(ms.Seeds))
+	}
+}
+
+// TestAggregateMultiSeedEmpty verifies empty input doesn't panic.
+func TestAggregateMultiSeedEmpty(t *testing.T) {
+	ms := AggregateMultiSeed(nil, nil)
+	if ms.MeanF1 != 0 || ms.StdF1 != 0 {
+		t.Errorf("empty aggregate should return zeros, got mean=%.4f std=%.4f", ms.MeanF1, ms.StdF1)
+	}
+}
