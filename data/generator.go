@@ -34,7 +34,7 @@ func DefaultConfig() GeneratorConfig {
 		NumMerchants:  200,
 		DurationHours: 72, // 3 days
 		FraudRate:     0.08,
-		Seed:          42,
+		Seed:          67,
 		OutputDir:     "generated_data",
 	}
 }
@@ -96,6 +96,8 @@ func Generate(cfg GeneratorConfig) (totalTxns int, fraudTxns int, err error) {
 
 	// Sort everything by timestamp for temporal consistency
 	sort.Slice(allTxns, func(i, j int) bool { return allTxns[i].Timestamp < allTxns[j].Timestamp })
+
+	// --- Held-out fraud injection is NOT here; gradual_creep is only in GenerateHeldOutCreep ---
 
 	// Build label lookup for sorted output
 	labelMap := make(map[int64]FraudLabel, len(allLabels))
@@ -327,6 +329,156 @@ func generateVelocitySpikeFraud(rng *rand.Rand, m MerchantConfig, startTime int6
 		*nextID++
 	}
 	return txns
+}
+
+// generateGradualCreepFraud creates 20-50 transactions that slowly increase in amount
+// over 3-5 days. Starts near the merchant's normal average and drifts upward by a few
+// percent per transaction. Uses normal inter-arrival times and mixed payment methods
+// to look realistic — the key signal is the monotonic amount drift, not a sudden spike.
+func generateGradualCreepFraud(rng *rand.Rand, m MerchantConfig, startTime int64, nextID *int64) []Transaction {
+	count := 20 + rng.Intn(31) // 20-50 transactions
+	durationDays := 3 + rng.Intn(3) // 3-5 days
+	durationSec := durationDays * 86400
+	creepRate := 0.02 + rng.Float64()*0.03 // 2-5% per transaction
+
+	var txns []Transaction
+	methods := []string{"upi", "card", "netbanking"}
+	methodWeights := []float64{0.60, 0.30, 0.10}
+
+	// Space transactions roughly evenly across the duration, with jitter
+	avgGapSec := float64(durationSec) / float64(count)
+
+	currentTime := float64(startTime)
+	baseAmount := float64(m.AvgAmountPaise)
+
+	for i := 0; i < count; i++ {
+		// Amount creeps up by creepRate per transaction
+		amount := baseAmount * math.Pow(1.0+creepRate, float64(i))
+		// Add small noise (±5%) to make it less perfectly monotonic
+		noise := 0.95 + rng.Float64()*0.10
+		amount *= noise
+
+		if amount < 100 {
+			amount = 100
+		}
+
+		txn := Transaction{
+			TxnID:       *nextID,
+			MerchantID:  m.ID,
+			AmountPaise: int64(amount),
+			Timestamp:   int64(currentTime),
+			Method:      weightedChoice(rng, methods, methodWeights),
+			Category:    m.Category,
+		}
+		txns = append(txns, txn)
+		*nextID++
+
+		// Move forward in time with jitter
+		gap := avgGapSec * (0.5 + rng.Float64()) // 50-150% of average gap
+		currentTime += gap
+	}
+	return txns
+}
+
+// GenerateHeldOutCreep creates a separate dataset containing ONLY normal traffic
+// plus gradual_creep fraud. No card_testing, amount_spike, or velocity_spike.
+// This is used for held-out evaluation: the detector was never tuned for this pattern.
+func GenerateHeldOutCreep(cfg GeneratorConfig) (totalTxns int, fraudTxns int, err error) {
+	rng := rand.New(rand.NewSource(cfg.Seed))
+
+	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
+		return 0, 0, fmt.Errorf("creating output dir: %w", err)
+	}
+
+	// Build merchant profiles
+	merchants := buildMerchants(rng, cfg.NumMerchants)
+
+	// Base timestamp: Aug 1 2026 00:00:00 IST
+	baseTime := int64(1785346200)
+
+	// Generate normal transactions for all merchants
+	var allTxns []Transaction
+	var allLabels []FraudLabel
+	txnID := int64(1)
+
+	for _, m := range merchants {
+		txns := generateNormalTraffic(rng, m, baseTime, cfg.DurationHours, &txnID)
+		for _, t := range txns {
+			allTxns = append(allTxns, t)
+			allLabels = append(allLabels, FraudLabel{TxnID: t.TxnID, IsFraud: false, FraudType: ""})
+		}
+	}
+
+	// Inject ONLY gradual_creep fraud into a subset of merchants
+	numFraudMerchants := int(float64(len(merchants)) * cfg.FraudRate)
+	perm := rng.Perm(len(merchants))
+	for i := 0; i < numFraudMerchants && i < len(perm); i++ {
+		m := merchants[perm[i]]
+		// Pick a random time in the second half of the timeline
+		fraudStart := baseTime + int64(cfg.DurationHours*3600/2) + int64(rng.Intn(cfg.DurationHours*3600/4))
+
+		fraudTxnsList := generateGradualCreepFraud(rng, m, fraudStart, &txnID)
+		for _, t := range fraudTxnsList {
+			allTxns = append(allTxns, t)
+			allLabels = append(allLabels, FraudLabel{TxnID: t.TxnID, IsFraud: true, FraudType: "gradual_creep"})
+			fraudTxns++
+		}
+	}
+
+	// Sort by timestamp
+	sort.Slice(allTxns, func(i, j int) bool { return allTxns[i].Timestamp < allTxns[j].Timestamp })
+
+	// Build label lookup
+	labelMap := make(map[int64]FraudLabel, len(allLabels))
+	for _, l := range allLabels {
+		labelMap[l.TxnID] = l
+	}
+
+	// Write transactions CSV
+	txnFile, err := os.Create(fmt.Sprintf("%s/transactions.csv", cfg.OutputDir))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer txnFile.Close()
+	txnWriter := csv.NewWriter(txnFile)
+	defer txnWriter.Flush()
+
+	for _, t := range allTxns {
+		if err := txnWriter.Write([]string{
+			strconv.FormatInt(t.TxnID, 10),
+			t.MerchantID,
+			strconv.FormatInt(t.AmountPaise, 10),
+			strconv.FormatInt(t.Timestamp, 10),
+			t.Method,
+			t.Category,
+		}); err != nil {
+			return 0, 0, fmt.Errorf("writing transaction CSV: %w", err)
+		}
+	}
+
+	// Write labels CSV
+	labelFile, err := os.Create(fmt.Sprintf("%s/labels.csv", cfg.OutputDir))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer labelFile.Close()
+	labelWriter := csv.NewWriter(labelFile)
+	defer labelWriter.Flush()
+
+	for _, t := range allTxns {
+		l := labelMap[t.TxnID]
+		isFraud := "0"
+		if l.IsFraud {
+			isFraud = "1"
+		}
+		labelWriter.Write([]string{
+			strconv.FormatInt(t.TxnID, 10),
+			isFraud,
+			l.FraudType,
+		})
+	}
+
+	return len(allTxns), fraudTxns, nil
 }
 
 // --- Utility Functions ---

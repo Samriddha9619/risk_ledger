@@ -22,7 +22,7 @@ type Transaction struct {
 type FraudLabel struct {
 	TxnID     int64
 	IsFraud   bool
-	FraudType string // "card_testing", "amount_spike", "velocity_spike", ""
+	FraudType string // "card_testing", "amount_spike", "velocity_spike", "gradual_creep", ""
 }
 
 // Column indices in the GoDB table — must match TableColumns() order.
