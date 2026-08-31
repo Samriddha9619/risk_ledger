@@ -1,23 +1,84 @@
 package detector
 
 import (
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Samriddha9619/risk_ledger/data"
 )
 
+// mockTriageTransport returns a valid OpenRouter-style JSON response
+// with BLOCK for txn 101 and APPROVE for txn 102.
+type mockTriageTransport struct{}
+
+func (m *mockTriageTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, _ := io.ReadAll(req.Body)
+	bodyStr := string(body)
+
+	// Check if this looks like a triage batch request (contains "txn_id")
+	if strings.Contains(bodyStr, "Transaction ID") {
+		mockJSON := `{
+			"choices": [{
+				"message": {
+					"content": "[{\"txn_id\": 101, \"decision\": \"BLOCK\", \"confidence\": 0.95, \"reasoning\": \"Velocity spike detected\", \"risk_factors\": [\"velocity_spike\"]}, {\"txn_id\": 102, \"decision\": \"APPROVE\", \"confidence\": 0.85, \"reasoning\": \"Normal transaction\", \"risk_factors\": []}]"
+				}
+			}]
+		}`
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(mockJSON)),
+			Header:     make(http.Header),
+		}, nil
+	}
+
+	// Default: return empty response
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(`{"choices": [{"message": {"content": "[]"}}]}`)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+// mockTriageApproveAllTransport returns APPROVE for all transactions —
+// used to test the safety gate override.
+type mockTriageApproveAllTransport struct{}
+
+func (m *mockTriageApproveAllTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Read the request body to extract transaction IDs
+	body, _ := io.ReadAll(req.Body)
+	bodyStr := string(body)
+	_ = bodyStr
+
+	// Always return APPROVE for txn 201 and 202
+	mockJSON := fmt.Sprintf(`{
+		"choices": [{
+			"message": {
+				"content": "[{\"txn_id\": 201, \"decision\": \"APPROVE\", \"confidence\": 0.80, \"reasoning\": \"Looks normal to me\", \"risk_factors\": []}, {\"txn_id\": 202, \"decision\": \"APPROVE\", \"confidence\": 0.90, \"reasoning\": \"Normal transaction\", \"risk_factors\": []}]"
+			}
+		}]
+	}`)
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(mockJSON)),
+		Header:     make(http.Header),
+	}, nil
+}
+
 // TestTriageFallbackBlocksOnHighStat verifies fallback blocks when stat score > 0.6 and rule fired.
 func TestTriageFallbackBlocksOnHighStat(t *testing.T) {
 	explainer := NewExplainer("") // disabled
 	profiles := make(map[string]*MerchantProfile)
-	te := NewTriageEngine(explainer, profiles)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
 
 	alert := Alert{
 		TxnID:         1,
 		MerchantID:    "test_merchant",
 		StatScore:     0.75,
-		ForestScore:   0.3,
-		CombinedScore: 0.55,
+		ForestScore:   0.65,
+		CombinedScore: 0.70,
 		StatAlert:     StatAlert{RuleFired: "amount_zscore", Score: 0.75},
 	}
 
@@ -34,7 +95,7 @@ func TestTriageFallbackBlocksOnHighStat(t *testing.T) {
 func TestTriageFallbackEscalatesOnMedium(t *testing.T) {
 	explainer := NewExplainer("")
 	profiles := make(map[string]*MerchantProfile)
-	te := NewTriageEngine(explainer, profiles)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
 
 	alert := Alert{
 		TxnID:         2,
@@ -51,11 +112,11 @@ func TestTriageFallbackEscalatesOnMedium(t *testing.T) {
 	}
 }
 
-// TestTriageFallbackApprovesOnLow verifies fallback approves when combined score is low.
-func TestTriageFallbackApprovesOnLow(t *testing.T) {
+// TestTriageFallbackEscalatesOnLow verifies fallback escalates when combined score is low (ambiguous band).
+func TestTriageFallbackEscalatesOnLow(t *testing.T) {
 	explainer := NewExplainer("")
 	profiles := make(map[string]*MerchantProfile)
-	te := NewTriageEngine(explainer, profiles)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
 
 	alert := Alert{
 		TxnID:         3,
@@ -67,8 +128,8 @@ func TestTriageFallbackApprovesOnLow(t *testing.T) {
 	}
 
 	d := te.fallbackTriage(alert)
-	if d.Decision != "APPROVE" {
-		t.Errorf("expected APPROVE for low score, got %s", d.Decision)
+	if d.Decision != "ESCALATE" {
+		t.Errorf("expected ESCALATE for low ambiguous score, got %s", d.Decision)
 	}
 }
 
@@ -76,7 +137,7 @@ func TestTriageFallbackApprovesOnLow(t *testing.T) {
 func TestTriageAutoBlockThreshold(t *testing.T) {
 	explainer := NewExplainer("")
 	profiles := make(map[string]*MerchantProfile)
-	te := NewTriageEngine(explainer, profiles)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
 
 	alerts := []Alert{
 		{TxnID: 1, MerchantID: "m1", CombinedScore: 0.90, StatAlert: StatAlert{RuleFired: "amount_zscore"}},
@@ -118,7 +179,7 @@ func TestTriageAutoBlockThreshold(t *testing.T) {
 func TestTriageMetricsWorkloadReduction(t *testing.T) {
 	explainer := NewExplainer("")
 	profiles := make(map[string]*MerchantProfile)
-	te := NewTriageEngine(explainer, profiles)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
 
 	// Create alerts: some above auto-block, some in middle, some below auto-approve
 	alerts := []Alert{
@@ -159,7 +220,7 @@ func TestTriageMetricsWorkloadReduction(t *testing.T) {
 func TestTriageDecisionFields(t *testing.T) {
 	explainer := NewExplainer("")
 	profiles := make(map[string]*MerchantProfile)
-	te := NewTriageEngine(explainer, profiles)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
 
 	alert := Alert{
 		TxnID:         100,
@@ -327,5 +388,97 @@ func TestEngineConfigCustomWeights(t *testing.T) {
 
 	if alert.CombinedScore < 0 || alert.CombinedScore > 1 {
 		t.Errorf("combined score %.4f out of [0,1]", alert.CombinedScore)
+	}
+}
+
+// TestAITriageBatchParsesValidJSON verifies that when the LLM returns valid JSON,
+// the AI decisions actually override the fallback decisions (not silently ignored).
+func TestAITriageBatchParsesValidJSON(t *testing.T) {
+	// Create a mock explainer with a transport that returns valid triage JSON
+	explainer := &Explainer{
+		APIKey:  "test-key",
+		Model:   "test-model",
+		Enabled: true,
+		client:  &http.Client{Transport: &mockTriageTransport{}},
+	}
+	profiles := make(map[string]*MerchantProfile)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
+
+	alerts := []Alert{
+		{TxnID: 101, MerchantID: "m1", CombinedScore: 0.65, StatScore: 0.6, ForestScore: 0.5, StatAlert: StatAlert{RuleFired: "velocity_spike", Score: 0.6}},
+		{TxnID: 102, MerchantID: "m2", CombinedScore: 0.55, StatScore: 0.4, ForestScore: 0.5, StatAlert: StatAlert{RuleFired: "", Score: 0.4}},
+	}
+	labels := map[int64]data.FraudLabel{
+		101: {TxnID: 101, IsFraud: true},
+		102: {TxnID: 102, IsFraud: false},
+	}
+	txns := []data.Transaction{
+		{TxnID: 101, MerchantID: "m1", AmountPaise: 50000, Timestamp: 1000000},
+		{TxnID: 102, MerchantID: "m2", AmountPaise: 1000, Timestamp: 1000001},
+	}
+
+	decisions, metrics := te.Triage(alerts, labels, txns)
+
+	// Verify AI actually drove the decisions (not fallback)
+	aiCount := 0
+	for _, d := range decisions {
+		if d.Source == "ai" {
+			aiCount++
+		}
+	}
+	if aiCount == 0 {
+		t.Error("expected at least one AI-sourced decision, got 0 — JSON parsing may be silently failing")
+	}
+	if metrics.AITriaged == 0 {
+		t.Errorf("AITriaged = 0, expected > 0 — AI decisions not being counted")
+	}
+}
+
+// TestAITriageSafetyGate verifies that the safety gate prevents the AI from
+// approving transactions with high combined scores (preventing dangerous false negatives).
+func TestAITriageSafetyGate(t *testing.T) {
+	// Create a mock that always returns APPROVE
+	explainer := &Explainer{
+		APIKey:  "test-key",
+		Model:   "test-model",
+		Enabled: true,
+		client:  &http.Client{Transport: &mockTriageApproveAllTransport{}},
+	}
+	profiles := make(map[string]*MerchantProfile)
+	te := NewTriageEngine(explainer, profiles, 0.50, 0.78)
+
+	// midpoint = (0.50 + 0.78) / 2 = 0.64
+	// TxnID 201: score 0.70 >= midpoint → safety gate should override APPROVE → ESCALATE
+	// TxnID 202: score 0.55 < midpoint → APPROVE is allowed
+	alerts := []Alert{
+		{TxnID: 201, MerchantID: "m1", CombinedScore: 0.70, StatScore: 0.6, ForestScore: 0.6, StatAlert: StatAlert{RuleFired: "velocity_spike", Score: 0.6}},
+		{TxnID: 202, MerchantID: "m2", CombinedScore: 0.55, StatScore: 0.4, ForestScore: 0.4, StatAlert: StatAlert{RuleFired: "", Score: 0.4}},
+	}
+	labels := map[int64]data.FraudLabel{
+		201: {TxnID: 201, IsFraud: true},
+		202: {TxnID: 202, IsFraud: false},
+	}
+	txns := []data.Transaction{
+		{TxnID: 201, MerchantID: "m1", AmountPaise: 50000, Timestamp: 1000000},
+		{TxnID: 202, MerchantID: "m2", AmountPaise: 1000, Timestamp: 1000001},
+	}
+
+	decisions, _ := te.Triage(alerts, labels, txns)
+
+	// Find decision for TxnID 201 (high score — should be ESCALATE due to safety gate)
+	for _, d := range decisions {
+		if d.TxnID == 201 {
+			if d.Decision == "APPROVE" {
+				t.Errorf("TxnID 201: safety gate FAILED — AI approved a high-score (%.2f) transaction that is actual fraud", d.CombinedScore)
+			}
+			if d.Decision != "ESCALATE" {
+				t.Errorf("TxnID 201: expected ESCALATE from safety gate, got %s", d.Decision)
+			}
+		}
+		if d.TxnID == 202 {
+			if d.Decision != "APPROVE" {
+				t.Errorf("TxnID 202: expected APPROVE (low score, safe), got %s", d.Decision)
+			}
+		}
 	}
 }

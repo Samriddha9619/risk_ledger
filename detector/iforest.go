@@ -64,10 +64,18 @@ func (f *IsolationForest) Score(sample []float64) float64 {
 	}
 
 	totalPathLength := 0.0
+	validTrees := 0
 	for _, tree := range f.Trees {
+		if tree == nil || tree.Root == nil {
+			continue
+		}
 		totalPathLength += pathLength(tree.Root, sample, 0)
+		validTrees++
 	}
-	avgPathLength := totalPathLength / float64(len(f.Trees))
+	if validTrees == 0 {
+		return 0.5
+	}
+	avgPathLength := totalPathLength / float64(validTrees)
 
 	// Normalize by expected path length c(n)
 	cn := expectedPathLength(float64(f.SubsampleSize))
