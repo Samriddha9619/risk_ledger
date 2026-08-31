@@ -20,10 +20,22 @@ type TransactionStore struct {
 	tableHeap   *execution.TableHeap
 	desc        *storage.RawTupleDesc
 	lockManager *transaction.LockManager
+	poolSize    int
+}
+
+// PoolSize returns the buffer pool capacity in pages.
+func (s *TransactionStore) PoolSize() int {
+	return s.poolSize
 }
 
 // NewTransactionStore initializes the GoDB storage engine and creates/opens the transactions table.
 func NewTransactionStore(dataDir string, truncate bool) (*TransactionStore, error) {
+	return NewTransactionStoreWithPoolSize(dataDir, truncate, 2000)
+}
+
+// NewTransactionStoreWithPoolSize creates a store with a configurable buffer pool size.
+// Use a small poolSize (e.g. 64) to stress-test page eviction under memory pressure.
+func NewTransactionStoreWithPoolSize(dataDir string, truncate bool, poolSize int) (*TransactionStore, error) {
 	if truncate {
 		_ = os.RemoveAll(dataDir)
 	}
@@ -46,7 +58,7 @@ func NewTransactionStore(dataDir string, truncate bool) (*TransactionStore, erro
 	// Initialize storage components
 	logManager := &storage.NoopLogManager{}
 	storageManager := storage.NewDiskStorageManager(dataDir)
-	bufferPool := storage.NewBufferPool(2000, storageManager, logManager)
+	bufferPool := storage.NewBufferPool(poolSize, storageManager, logManager)
 	lockManager := transaction.NewLockManager()
 
 	// Create table heap
@@ -63,6 +75,7 @@ func NewTransactionStore(dataDir string, truncate bool) (*TransactionStore, erro
 		tableHeap:   tableHeap,
 		desc:        desc,
 		lockManager: lockManager,
+		poolSize:    poolSize,
 	}, nil
 }
 

@@ -228,12 +228,18 @@ func printRow(name string, r EvalResult) {
 		name, r.Precision, r.Recall, r.F1, costPerDay)
 }
 
-// PrintTriageReport outputs the AI triage metrics.
-func PrintTriageReport(m detector.TriageMetrics) {
+// PrintTriageReport outputs the triage metrics with honest labeling.
+// noLLM indicates whether the LLM was disabled (labels will say "Rule-based" instead of "AI").
+// autoBlockThreshold is the actual threshold used for auto-blocking.
+func PrintTriageReport(m detector.TriageMetrics, noLLM bool, autoBlockThreshold float64) {
 	sep := strings.Repeat("─", 60)
 	fmt.Println()
 	fmt.Println("  " + sep)
-	fmt.Println("  AI TRIAGE REPORT — Verification Workload Reduction")
+	if noLLM {
+		fmt.Println("  RULE-BASED TRIAGE REPORT — Verification Workload Reduction")
+	} else {
+		fmt.Println("  AI TRIAGE REPORT — Verification Workload Reduction")
+	}
 	fmt.Println("  " + sep)
 	fmt.Println()
 
@@ -241,14 +247,36 @@ func PrintTriageReport(m detector.TriageMetrics) {
 	fmt.Printf("  Total flagged:        %d\n", m.TotalFlagged)
 	fmt.Println()
 
+	// Use honest labels: "Rule-based" when no LLM was involved
+	decisionLabel := "AI"
+	if noLLM {
+		decisionLabel = "Rule-based"
+	}
+
+	if !noLLM && m.TotalFlagged > 0 {
+		needsAI := m.TotalFlagged - m.AutoBlocked
+		if needsAI > 0 {
+			aiPct := float64(m.AITriaged) / float64(needsAI) * 100
+			fmt.Printf("  AI-resolved: %d/%d (%.1f%%) — remaining routed to deterministic fallback (rate-limit/timeout)\n", m.AITriaged, needsAI, aiPct)
+			fmt.Println()
+		}
+	}
+
 	fmt.Println("  Resolution breakdown:")
-	fmt.Printf("    Auto-blocked (score > 0.85):     %d\n", m.AutoBlocked)
-	fmt.Printf("    AI blocked:                      %d\n", m.AIBlocked)
-	fmt.Printf("    AI approved (false alarm):        %d\n", m.AIApproved)
-	fmt.Printf("    AI escalated → human queue:       %d\n", m.AIEscalated)
+	fmt.Printf("    Auto-blocked (score > %.2f):     %d\n", autoBlockThreshold, m.AutoBlocked)
+	if m.AITriaged > 0 {
+		fmt.Printf("    %s blocked:                      %d\n", decisionLabel, m.AIBlocked)
+		fmt.Printf("    %s approved (false alarm):        %d\n", decisionLabel, m.AIApproved)
+		fmt.Printf("    %s escalated → human queue:       %d\n", decisionLabel, m.AIEscalated)
+	}
+	if m.FallbackTriaged > 0 {
+		fmt.Printf("    Fallback blocked:                 %d\n", m.FallbackBlocked)
+		fmt.Printf("    Fallback approved (false alarm):   %d\n", m.FallbackApproved)
+		fmt.Printf("    Fallback escalated → human queue:  %d\n", m.FallbackEscalated)
+	}
 	fmt.Println()
 
-	totalResolved := m.AutoBlocked + m.AIBlocked + m.AIApproved
+	totalResolved := m.AutoBlocked + m.AIBlocked + m.AIApproved + m.FallbackBlocked + m.FallbackApproved
 	fmt.Printf("  ┌────────────────────────────────────────────┐\n")
 	fmt.Printf("  │  WORKLOAD REDUCTION:  %.0f%%                  │\n", m.WorkloadReduction*100)
 	fmt.Printf("  │  %d of %d alerts auto-resolved          │\n", totalResolved, m.TotalFlagged)
@@ -264,12 +292,32 @@ func PrintTriageReport(m detector.TriageMetrics) {
 	if m.AIBlocked+m.AIApproved > 0 {
 		aiCorrect := m.AIBlockCorrect + m.AIApproveCorrect
 		aiTotal := m.AIBlocked + m.AIApproved
-		fmt.Printf("    AI decision accuracy: %d/%d (%.1f%%)\n", aiCorrect, aiTotal, float64(aiCorrect)/float64(aiTotal)*100)
+		if aiTotal < 10 {
+			fmt.Printf("    %s decision accuracy: insufficient sample (n=%d)\n", decisionLabel, aiTotal)
+		} else {
+			fmt.Printf("    %s decision accuracy: %d/%d (%.1f%%)\n", decisionLabel, aiCorrect, aiTotal, float64(aiCorrect)/float64(aiTotal)*100)
+		}
 	}
+	if m.FallbackBlocked+m.FallbackApproved > 0 {
+		fbCorrect := m.FallbackBlockCorrect + m.FallbackApproveCorrect
+		fbTotal := m.FallbackBlocked + m.FallbackApproved
+		if fbTotal < 10 {
+			fmt.Printf("    Fallback decision accuracy: insufficient sample (n=%d)\n", fbTotal)
+		} else {
+			fmt.Printf("    Fallback decision accuracy: %d/%d (%.1f%%)\n", fbCorrect, fbTotal, float64(fbCorrect)/float64(fbTotal)*100)
+		}
+	}
+	
 	if m.AIApproveWrong > 0 {
-		fmt.Printf("    ⚠ AI approved actual fraud: %d (DANGEROUS)\n", m.AIApproveWrong)
-	} else {
-		fmt.Printf("    ✓ AI approved actual fraud: 0 (safe)\n")
+		fmt.Printf("    ⚠ %s approved actual fraud: %d (DANGEROUS)\n", decisionLabel, m.AIApproveWrong)
+	} else if m.AITriaged > 0 {
+		fmt.Printf("    ✓ %s approved actual fraud: 0 (safe)\n", decisionLabel)
+	}
+
+	if m.FallbackApproveWrong > 0 {
+		fmt.Printf("    ⚠ Fallback approved actual fraud: %d (DANGEROUS)\n", m.FallbackApproveWrong)
+	} else if m.FallbackTriaged > 0 {
+		fmt.Printf("    ✓ Fallback approved actual fraud: 0 (safe)\n")
 	}
 	fmt.Println()
 }

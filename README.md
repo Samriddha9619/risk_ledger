@@ -20,15 +20,15 @@ go run . run --demo
 
 # Multi-seed validation
 go run . run --no-llm --seeds=42,123,456,789,1337
-
-# Live monitoring dashboard
-go run . serve
-# → http://localhost:8080
 ```
 
-## The Problem
+## The Problem: AI Risk Manager (Razorpay Buildathon Track 2)
 
-Razorpay's bottleneck is **verification capacity** — humans manually reviewing flagged transactions. The industry approach generates alerts with AI explanations, but that just creates more reading material. The real need is **fewer alerts in the human queue**.
+This project is built for **Track 2: AI Risk Manager** — specifically as a **Fraud-Spike Detector**.
+
+AI-enabled fraud is hitting the BFSI sector hard. The standard industry response is to build detection systems that flag thousands of suspicious transactions with "AI explanations", which just creates more reading material for human reviewers. The real bottleneck is **verification capacity**.
+
+To stop merchants from losing money to fraud without choking their operations, the goal isn't just to detect anomalies—it's to safely auto-resolve them. This pipeline evaluates transaction spikes, measures precision and recall on a held-out test set, tracks the exact false-positive cost of every decision, and uses LLM triage to auto-resolve the ambiguous middle-band of alerts, driving down the human review queue.
 
 ## The Solution: AI Triage
 

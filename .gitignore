@@ -1,0 +1,26 @@
+# Generated data and results
+generated_data/
+risk_ledger_db/
+results/
+
+# Binary
+risk_ledger
+
+# Environment
+.env
+
+# Go
+*.test
+*.out
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
