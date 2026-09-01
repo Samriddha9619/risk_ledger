@@ -10,4 +10,4 @@ require (
 	github.com/xwb1989/sqlparser v0.0.0-20180606152119-120387863bf2 // indirect
 )
 
-replace mit.edu/dsg/godb => ../godb
+replace mit.edu/dsg/godb => github.com/Samriddha9619/go-database-internal v0.0.0-20260609134136-a4e446f6d6c2
