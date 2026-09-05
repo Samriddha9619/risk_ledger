@@ -1,7 +1,11 @@
-# Generated data and results
+# Generated data, local experiments, and raw datasets
 generated_data/
 risk_ledger_db/
 results/
+docs/
+experiments/
+kaggle/
+RecoverX/
 
 # Binary
 risk_ledger
@@ -24,3 +28,7 @@ coverage.out
 # OS
 .DS_Store
 Thumbs.db
+
+# Large raw/local data files
+*.dat
+*.csv

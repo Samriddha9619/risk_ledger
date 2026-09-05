@@ -24,26 +24,46 @@ type Explanation struct {
 	Error       string // non-empty if LLM call failed
 }
 
-// Explainer calls Gemini API to generate human-readable fraud explanations.
+// Explainer calls LLM API to generate human-readable fraud explanations.
 type Explainer struct {
-	APIKey  string
-	Model   string
-	Enabled bool
-	client  *http.Client // properly configured HTTP client
+	APIKey          string
+	Model           string
+	Enabled         bool
+	UseGeminiDirect bool // if true, call Gemini REST API directly instead of OpenRouter
+	client          *http.Client
 }
 
-// NewExplainer creates an explainer. If apiKey is empty, it tries GEMINI_API_KEY env var.
-// If neither is available, the explainer is disabled (returns fallback explanations).
+// NewExplainer creates an explainer. Prefers GEMINI_API_KEY (direct, 1500 RPD free)
+// over OPENROUTER_API_KEY (50 RPD free). If neither is available, the explainer is disabled.
 func NewExplainer(apiKey string) *Explainer {
+	// Prefer Gemini direct API (much higher free-tier limits)
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	if geminiKey != "" {
+		fmt.Println("  [AI] Using Gemini API directly (1500 req/day free)")
+		return &Explainer{
+			APIKey:          geminiKey,
+			Model:           "gemini-3.6-flash",
+			Enabled:         true,
+			UseGeminiDirect: true,
+			client: &http.Client{
+				Timeout: 30 * time.Second,
+			},
+		}
+	}
+
+	// Fallback to OpenRouter
 	if apiKey == "" {
 		apiKey = os.Getenv("OPENROUTER_API_KEY")
 	}
+	if apiKey != "" {
+		fmt.Println("  [AI] Using OpenRouter (50 req/day free — may hit limits)")
+	}
 	return &Explainer{
 		APIKey:  apiKey,
-		Model:   "openrouter/free",
+		Model:   "google/gemma-4-31b-it:free",
 		Enabled: apiKey != "",
 		client: &http.Client{
-			Timeout: 15 * time.Second, // reduced to fail fast on slow free models
+			Timeout: 30 * time.Second,
 		},
 	}
 }
@@ -176,7 +196,7 @@ func buildPrompt(alert Alert, profile *MerchantProfile, recentTxns []data.Transa
 		}
 	}
 
-	sb.WriteString("\nRespond in this exact JSON format:\n")
+	sb.WriteString("\nRespond ONLY with valid JSON. Do not use markdown blocks, backticks, or newlines outside the JSON.\n")
 	sb.WriteString(`{"summary": "...", "risk_factors": ["...", "..."], "action": "..."}`)
 	sb.WriteString("\n\nDo not suggest any offensive or fraud-enabling actions. Focus on defensive measures only.")
 	return sb.String()
@@ -239,55 +259,12 @@ func (e *Explainer) callGeminiWithRetry(ctx context.Context, prompt string, merc
 }
 
 func (e *Explainer) callGemini(ctx context.Context, prompt string, merchantID string) Explanation {
-	url := "https://openrouter.ai/api/v1/chat/completions"
-
-	reqBody := openRouterRequest{
-		Model: e.Model,
-		Messages: []openRouterMessage{{
-			Role:    "user",
-			Content: prompt,
-		}},
-		MaxTokens: 400,
-	}
-
-	body, err := json.Marshal(reqBody)
+	text, err := e.callLLM(ctx, prompt, 1024)
 	if err != nil {
-		return Explanation{MerchantID: merchantID, Error: fmt.Sprintf("marshal error: %v", err)}
+		return Explanation{MerchantID: merchantID, Error: err.Error()}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return Explanation{MerchantID: merchantID, Error: fmt.Sprintf("create request: %v", err)}
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+e.APIKey)
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return Explanation{MerchantID: merchantID, Error: fmt.Sprintf("API call failed: %v", err)}
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Explanation{MerchantID: merchantID, Error: fmt.Sprintf("read response: %v", err)}
-	}
-
-	if resp.StatusCode != 200 {
-		return Explanation{MerchantID: merchantID, Error: fmt.Sprintf("API %d: %s", resp.StatusCode, string(respBody))}
-	}
-
-	var orResp openRouterResponse
-	if err := json.Unmarshal(respBody, &orResp); err != nil {
-		return Explanation{MerchantID: merchantID, Error: fmt.Sprintf("parse response: %v", err)}
-	}
-
-	if len(orResp.Choices) == 0 || orResp.Choices[0].Message.Content == "" {
-		return Explanation{MerchantID: merchantID, Error: "empty response from OpenRouter"}
-	}
-
-	text := orResp.Choices[0].Message.Content
-	// Try to extract JSON from the response (Gemini may wrap it in markdown)
+	// Try to extract JSON from the response (LLM may wrap it in markdown)
 	text = strings.TrimSpace(text)
 	if idx := strings.Index(text, "{"); idx >= 0 {
 		if end := strings.LastIndex(text, "}"); end > idx {
@@ -300,7 +277,7 @@ func (e *Explainer) callGemini(ctx context.Context, prompt string, merchantID st
 		// If JSON parsing fails, use the raw text as summary
 		return Explanation{
 			MerchantID: merchantID,
-			Summary:    orResp.Choices[0].Message.Content,
+			Summary:    text,
 			Action:     "Review flagged transactions manually",
 		}
 	}
@@ -313,7 +290,138 @@ func (e *Explainer) callGemini(ctx context.Context, prompt string, merchantID st
 	}
 }
 
-// fallbackExplanations generates rule-based explanations when LLM is unavailable.
+// callLLM routes to either Gemini direct API or OpenRouter based on configuration.
+func (e *Explainer) callLLM(ctx context.Context, prompt string, maxTokens int) (string, error) {
+	if e.UseGeminiDirect {
+		return e.callGeminiDirect(ctx, prompt, maxTokens)
+	}
+	return e.callOpenRouter(ctx, prompt, maxTokens)
+}
+
+// callGeminiDirect calls the Gemini REST API directly.
+func (e *Explainer) callGeminiDirect(ctx context.Context, prompt string, maxTokens int) (string, error) {
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", e.Model, e.APIKey)
+
+	type part struct {
+		Text string `json:"text"`
+	}
+	type content struct {
+		Parts []part `json:"parts"`
+	}
+	type genConfig struct {
+		MaxOutputTokens int `json:"maxOutputTokens"`
+	}
+	type geminiReq struct {
+		Contents         []content `json:"contents"`
+		GenerationConfig genConfig `json:"generationConfig"`
+	}
+
+	reqBody := geminiReq{
+		Contents: []content{{
+			Parts: []part{{Text: prompt}},
+		}},
+		GenerationConfig: genConfig{MaxOutputTokens: maxTokens},
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("API call failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %v", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("API %d: %.200s", resp.StatusCode, string(respBody))
+	}
+
+	type geminiResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+
+	var gResp geminiResp
+	if err := json.Unmarshal(respBody, &gResp); err != nil {
+		return "", fmt.Errorf("parse: %v", err)
+	}
+
+	if len(gResp.Candidates) == 0 || len(gResp.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("empty response from Gemini")
+	}
+
+	return gResp.Candidates[0].Content.Parts[0].Text, nil
+}
+
+// callOpenRouter calls the OpenRouter Chat Completions API.
+func (e *Explainer) callOpenRouter(ctx context.Context, prompt string, maxTokens int) (string, error) {
+	url := "https://openrouter.ai/api/v1/chat/completions"
+
+	reqBody := openRouterRequest{
+		Model: e.Model,
+		Messages: []openRouterMessage{{
+			Role:    "user",
+			Content: prompt,
+		}},
+		MaxTokens: maxTokens,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e.APIKey)
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("API call failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %v", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("API %d: %.200s", resp.StatusCode, string(respBody))
+	}
+
+	var orResp openRouterResponse
+	if err := json.Unmarshal(respBody, &orResp); err != nil {
+		return "", fmt.Errorf("parse: %v", err)
+	}
+
+	if len(orResp.Choices) == 0 || orResp.Choices[0].Message.Content == "" {
+		return "", fmt.Errorf("empty response from OpenRouter")
+	}
+
+	return orResp.Choices[0].Message.Content, nil
+}
 func (e *Explainer) fallbackExplanations(alerts []Alert, profiles map[string]*MerchantProfile, topN int) []Explanation {
 	sorted := make([]Alert, len(alerts))
 	copy(sorted, alerts)

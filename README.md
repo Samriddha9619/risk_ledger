@@ -11,7 +11,11 @@ cd risk_ledger
 # Full pipeline: generate → store → train → evaluate → triage
 go run . run --no-llm
 
-# With AI-powered triage (any OpenAI-compatible API key works)
+# With AI-powered triage (preferred: Gemini API — 1500 req/day free)
+export GEMINI_API_KEY="your_key_here"  # get from https://aistudio.google.com/apikey
+go run . run
+
+# Or use OpenRouter (50 req/day free — may hit limits)
 export OPENROUTER_API_KEY="your_key_here"
 go run . run
 
@@ -84,7 +88,6 @@ graph LR
     G --> I[Rule-based Fallback]
     F --> J[Evaluation Framework]
     J --> K[Multi-Seed Validation]
-    F --> L[Live Dashboard + SSE]
 ```
 
 ### Components

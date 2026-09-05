@@ -451,6 +451,7 @@ func runEval(txns []data.Transaction, labels map[int64]data.FraudLabel) {
 		optimal,
 		patterns,
 		explanations,
+		!explainer.Enabled,
 	)
 
 	// Print triage report

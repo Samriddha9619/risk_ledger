@@ -1,13 +1,10 @@
 package detector
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +13,15 @@ import (
 
 	"github.com/Samriddha9619/risk_ledger/data"
 )
+
+// aiTriageResult represents a single AI triage decision parsed from LLM JSON output.
+type aiTriageResult struct {
+	TxnID       int64    `json:"txn_id"`
+	Decision    string   `json:"decision"`
+	Confidence  float64  `json:"confidence"`
+	Reasoning   string   `json:"reasoning"`
+	RiskFactors []string `json:"risk_factors"`
+}
 
 // TriageDecision represents the AI's decision on a flagged transaction.
 type TriageDecision struct {
@@ -261,8 +267,8 @@ func countDecisionMetrics(metrics *TriageMetrics, d TriageDecision, label data.F
 // Workers write to non-overlapping slices — no races. Rate limiting via per-worker sleep.
 func (te *TriageEngine) aiTriageConcurrent(ctx context.Context, alerts []Alert, labels map[int64]data.FraudLabel, txnsByMerchant map[string][]data.Transaction) []TriageDecision {
 	decisions := make([]TriageDecision, len(alerts))
-	batchSize := 20 // 20 txns × ~80 tokens/obj ≈ 1600 tokens, fits in MaxTokens=4096
-	workers := 3    // 3 workers × ~1 req/5s = ~36 RPM peak, backoff handles 429s
+	batchSize := 5  // small batches to avoid token truncation on free-tier models
+	workers := 2   // 2 workers to stay well under free-tier RPM limits
 
 	type batchJob struct {
 		startIdx int
@@ -351,43 +357,25 @@ func (te *TriageEngine) aiTriageBatch(ctx context.Context, alerts []Alert, label
 	}
 
 	var sb strings.Builder
-	sb.WriteString("You are an automated fraud triage system at an Indian payment gateway.\n")
-	sb.WriteString("You must make ONE decision for each flagged transaction: BLOCK, APPROVE, or ESCALATE.\n")
-	sb.WriteString("BLOCK = definitely fraud, block immediately, no human needed\n")
-	sb.WriteString("APPROVE = false alarm, let it through, no human needed\n")
-	sb.WriteString("ESCALATE = uncertain, send to human reviewer\n\n")
-	sb.WriteString("Here is a list of transactions to evaluate:\n\n")
+	sb.WriteString("You are a fraud triage system. For each transaction below, output ONLY a JSON array. No explanation, no markdown, no commentary.\n\n")
 
 	for _, alert := range alerts {
 		profile := te.profiles[alert.MerchantID]
-		recentTxns := txnsByMerchant[alert.MerchantID]
 
-		sb.WriteString(fmt.Sprintf("--- Transaction ID: %d ---\n", alert.TxnID))
-		sb.WriteString(fmt.Sprintf("Merchant: %s\n", alert.MerchantID))
-		sb.WriteString(fmt.Sprintf("Detection scores: stat=%.2f, ml=%.2f, combined=%.2f\n", alert.StatScore, alert.ForestScore, alert.CombinedScore))
+		sb.WriteString(fmt.Sprintf("TXN %d: merchant=%s, stat=%.2f, ml=%.2f, combined=%.2f",
+			alert.TxnID, alert.MerchantID, alert.StatScore, alert.ForestScore, alert.CombinedScore))
 		if alert.StatAlert.RuleFired != "" {
-			sb.WriteString(fmt.Sprintf("Primary rule fired: %s\n", alert.StatAlert.RuleFired))
-			sb.WriteString(fmt.Sprintf("  Amount Z-score: %.2f\n", alert.StatAlert.AmountZScore))
-			sb.WriteString(fmt.Sprintf("  Velocity ratio: %.2fx normal\n", alert.StatAlert.VelocityRatio))
+			sb.WriteString(fmt.Sprintf(", rule=%s, zscore=%.1f, vel=%.1fx",
+				alert.StatAlert.RuleFired, alert.StatAlert.AmountZScore, alert.StatAlert.VelocityRatio))
 		}
 		if profile != nil {
-			sb.WriteString(fmt.Sprintf("Merchant profile: Avg=₹%.0f, Stddev=₹%.0f, Count=%d\n", profile.Mean/100.0, profile.Stddev()/100.0, profile.Count))
-		}
-		if len(recentTxns) > 0 {
-			sb.WriteString("Last 3 transactions:\n")
-			start := len(recentTxns) - 3
-			if start < 0 {
-				start = 0
-			}
-			for _, t := range recentTxns[start:] {
-				sb.WriteString(fmt.Sprintf("  ₹%.0f via %s at %s\n", float64(t.AmountPaise)/100.0, t.Method, time.Unix(t.Timestamp, 0).Format("15:04:05")))
-			}
+			sb.WriteString(fmt.Sprintf(", avg=%.0f, std=%.0f", profile.Mean/100.0, profile.Stddev()/100.0))
 		}
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("Respond in this exact JSON array format:\n")
-	sb.WriteString(`[{"txn_id": 123, "decision": "BLOCK|APPROVE|ESCALATE", "confidence": 0.9, "reasoning": "one line", "risk_factors": ["factor1"]}, ...]`)
+	sb.WriteString("\nDecide BLOCK, APPROVE, or ESCALATE for each. Output ONLY this JSON array, nothing else:\n")
+	sb.WriteString(`[{"txn_id":123,"decision":"BLOCK","confidence":0.9,"reasoning":"short","risk_factors":["x"]}]`)
 
 	prompt := sb.String()
 
@@ -411,17 +399,18 @@ func (te *TriageEngine) aiTriageBatch(ctx context.Context, alerts []Alert, label
 		return decisions
 	}
 
-	var aiResults []struct {
-		TxnID       int64    `json:"txn_id"`
-		Decision    string   `json:"decision"`
-		Confidence  float64  `json:"confidence"`
-		Reasoning   string   `json:"reasoning"`
-		RiskFactors []string `json:"risk_factors"`
-	}
+	var aiResults []aiTriageResult
 
+	// Try direct array parse first
 	if err := json.Unmarshal([]byte(respBody), &aiResults); err != nil {
-		fmt.Printf("    [WARN] AI JSON parse failed (falling back): %v | raw response (first 200 chars): %.200s\n", err, respBody)
-		return decisions
+		// Response might be truncated or wrapped in text.
+		// Try to extract individual JSON objects from the response.
+		aiResults = extractJSONObjects(respBody)
+		if len(aiResults) == 0 {
+			fmt.Printf("    [WARN] AI response not parseable (falling back): %.120s\n", respBody)
+			return decisions
+		}
+		fmt.Printf("    [INFO] Recovered %d/%d decisions from partial AI response\n", len(aiResults), len(alerts))
 	}
 
 	// Build alert lookup for safety gate
@@ -468,73 +457,11 @@ func (te *TriageEngine) aiTriageBatch(ctx context.Context, alerts []Alert, label
 }
 
 func (te *TriageEngine) callOpenRouterTriageBatch(ctx context.Context, prompt string) (string, error) {
-	url := "https://openrouter.ai/api/v1/chat/completions"
-
-	type openRouterMessage struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-
-	type openRouterRequest struct {
-		Model    string              `json:"model"`
-		Messages []openRouterMessage `json:"messages"`
-		MaxTokens int                `json:"max_tokens,omitempty"`
-	}
-
-	reqBody := openRouterRequest{
-		Model: te.explainer.Model,
-		Messages: []openRouterMessage{{
-			Role:    "user",
-			Content: prompt,
-		}},
-		MaxTokens: 4096, // batch of 10 txns needs ~2000-3000 tokens of JSON output
-	}
-
-	body, err := json.Marshal(reqBody)
+	text, err := te.explainer.callLLM(ctx, prompt, 8192)
 	if err != nil {
-		return "", fmt.Errorf("marshal: %v", err)
+		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+te.explainer.APIKey)
-
-	resp, err := te.explainer.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read: %v", err)
-	}
-
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("API %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	type openRouterResponse struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-
-	var orResp openRouterResponse
-	if err := json.Unmarshal(respBody, &orResp); err != nil {
-		return "", fmt.Errorf("parse JSON: %v", err)
-	}
-
-	if len(orResp.Choices) == 0 || orResp.Choices[0].Message.Content == "" {
-		return "", fmt.Errorf("empty response")
-	}
-
-	text := orResp.Choices[0].Message.Content
 	text = strings.TrimSpace(text)
 	if idx := strings.Index(text, "["); idx >= 0 {
 		if end := strings.LastIndex(text, "]"); end > idx {
@@ -543,4 +470,40 @@ func (te *TriageEngine) callOpenRouterTriageBatch(ctx context.Context, prompt st
 	}
 
 	return text, nil
+}
+
+// extractJSONObjects scans a (possibly truncated) string for individual JSON objects
+// matching the triage response schema. This handles cases where the LLM response is
+// truncated mid-array or wrapped in non-JSON text.
+func extractJSONObjects(text string) []aiTriageResult {
+	var results []aiTriageResult
+
+	// Scan through the text finding individual { ... } JSON objects
+	for i := 0; i < len(text); i++ {
+		if text[i] != '{' {
+			continue
+		}
+		// Find the matching closing brace
+		depth := 0
+		for j := i; j < len(text); j++ {
+			switch text[j] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					candidate := text[i : j+1]
+					var r aiTriageResult
+					if err := json.Unmarshal([]byte(candidate), &r); err == nil && r.TxnID != 0 && r.Decision != "" {
+						results = append(results, r)
+					}
+					i = j // skip past this object
+					goto nextObj
+				}
+			}
+		}
+		break // unclosed brace = truncated, stop
+	nextObj:
+	}
+	return results
 }

@@ -72,6 +72,7 @@ func PrintReport(
 	optimal EvalResult,
 	patterns []PerPatternResult,
 	explanations []detector.Explanation,
+	noLLM bool,
 ) {
 	sep := strings.Repeat("═", 60)
 	fmt.Println()
@@ -132,7 +133,11 @@ func PrintReport(
 
 	// LLM Explanations
 	if len(explanations) > 0 {
-		fmt.Println("  ─── AI-Powered Alert Explanations (Top Alerts) ───")
+		if noLLM {
+			fmt.Println("  ─── Rule-Based Alert Explanations (Top Alerts) ───")
+		} else {
+			fmt.Println("  ─── AI-Powered Alert Explanations (Top Alerts) ───")
+		}
 		fmt.Println()
 		for i, exp := range explanations {
 			if exp.Error != "" {
